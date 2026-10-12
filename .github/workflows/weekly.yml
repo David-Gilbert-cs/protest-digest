@@ -1,0 +1,24 @@
+name: Weekly protest digest
+
+on:
+  schedule:
+    # Mondays 11:00 UTC = 07:00 in Montreal during daylight time, 06:00 in winter.
+    # GitHub may start scheduled runs a few minutes late.
+    - cron: "0 11 * * 1"
+  workflow_dispatch: {}
+
+jobs:
+  send:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m unittest -v
+      - run: python digest.py
+        env:
+          GMAIL_USER: ${{ secrets.GMAIL_USER }}
+          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+          DIGEST_TO: ${{ secrets.DIGEST_TO }}
