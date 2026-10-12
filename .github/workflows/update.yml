@@ -1,0 +1,29 @@
+name: Update protest calendar
+
+on:
+  schedule:
+    # Every day at 10:00 UTC (06:00 in Montreal during daylight time, 05:00 in winter).
+    - cron: "0 10 * * *"
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m unittest -v
+      - run: python digest.py
+      - name: Publish (commit docs/ if it changed; GitHub Pages serves it)
+        run: |
+          git add docs
+          if git diff --cached --quiet; then echo "no change"; exit 0; fi
+          git -c user.name="protest-digest bot" -c user.email="actions@users.noreply.github.com" \
+            commit -m "Update protest calendar $(date -u +%F)"
+          git push

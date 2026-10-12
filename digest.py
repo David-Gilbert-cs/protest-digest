@@ -1,30 +1,24 @@
-"""Weekly email of upcoming protests in Montreal and Saint-Jean-sur-Richelieu. Standard library only.
+"""Upcoming protests in Montreal and Saint-Jean-sur-Richelieu as a calendar feed and a web page.
+Standard library only.
 
-  python digest.py              build the digest for the next 7 days and email it
-  python digest.py --dry-run    print it instead (also writes digest.html next to this file)
+  python digest.py            write docs/protests.ics (next CALENDAR_DAYS days) and docs/index.html (next 7 days)
+  python digest.py --print    print the 7-day digest as text instead
 
-Environment, either
-  RESEND_API_KEY, DIGEST_TO (the Resend account's own address unless a domain is verified), optional DIGEST_FROM
-or
-  GMAIL_USER, GMAIL_APP_PASSWORD (a Google "app password"), DIGEST_TO (defaults to GMAIL_USER).
+If the event source can't be read, nothing is written and the exit code is non-zero, so a bad run never
+empties the published calendar.
 """
 
 import argparse
+import hashlib
 import html
-import json
-import os
 import re
-import smtplib
-import ssl
 import sys
 import unicodedata
-import urllib.error
 import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
-from datetime import date, datetime, timedelta
-from email.message import EmailMessage
+from datetime import date, datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
 from pathlib import Path
 
@@ -42,7 +36,9 @@ NEWS_QUERIES = {
     "Montréal": "Montréal (manifestation OR manifestants OR rassemblement) when:7d",
 }
 NEWS_PER_CITY = 8
-UA = "Mozilla/5.0 (protest-digest; personal weekly email)"
+UA = "Mozilla/5.0 (protest-digest; personal calendar feed)"
+CALENDAR_DAYS = 60
+OUT_DIR = Path(__file__).with_name("docs")
 
 # Matched against accent-free lowercase text.
 PROTEST_TITLE = re.compile(
@@ -85,6 +81,8 @@ class Digest:
     others: list = field(default_factory=list)
     news: dict = field(default_factory=dict)
     warnings: list = field(default_factory=list)
+    calendar: list = field(default_factory=list)  # protests over the next CALENDAR_DAYS days
+    source_ok: bool = False
 
 
 def fold(s):
@@ -167,18 +165,23 @@ def today():
 def build(start=None, days=7):
     start = start or today()
     end = start + timedelta(days=days - 1)
+    horizon = start + timedelta(days=CALENDAR_DAYS - 1)
     d = Digest(start=start, end=end)
     try:
         events = parse_rm_calendar(fetch(RM_CALENDAR))
+        d.source_ok = bool(events)
         if not events:
             d.warnings.append("Résistance Montréal's calendar returned no events; its page format may have changed.")
         seen = set()
         for ev in sorted(events, key=lambda e: e.start):
             key = (ev.title, ev.start)
-            if key in seen or not start <= ev.start.date() <= end:
+            if key in seen or not start <= ev.start.date() <= horizon:
                 continue
             seen.add(key)
-            (d.protests if ev.is_protest else d.others).append(ev)
+            if ev.is_protest:
+                d.calendar.append(ev)
+            if ev.start.date() <= end:
+                (d.protests if ev.is_protest else d.others).append(ev)
     except Exception as e:
         d.warnings.append(f"Could not read Résistance Montréal's calendar: {e}")
     for city, q in NEWS_QUERIES.items():
@@ -220,7 +223,7 @@ def excerpt(s, n=350):
 def subject(d):
     n = len(d.protests)
     span = f"{fmt_day(d.start)} – {fmt_day(d.end)}"
-    return f"Protests this week ({n}) · {span}" if n else f"Protests this week: none listed · {span}"
+    return f"Protests, next 7 days ({n}) · {span}" if n else f"Protests, next 7 days: none listed · {span}"
 
 
 CITIES = ["Montréal", "Saint-Jean-sur-Richelieu"]
@@ -243,7 +246,7 @@ def render_text(d):
         out += [f"    {u}" for u in (e.official_url, e.source_url) if u]
         out.append("")
     if d.others:
-        out.append("Other events this week, not detected as protests (check in case one is):")
+        out.append("Other events, next 7 days, not detected as protests (check in case one is):")
         out += [f"  - {fmt_when(e)} | {e.title} | {e.source_url}" for e in d.others]
         out.append("")
     for city in CITIES:
@@ -285,7 +288,7 @@ def render_html(d):
                      f'({e_(fmt_when(e))}, {e_(fmt_where(e))})<br>{e_(excerpt(e.description))}<br>{links}</p>')
     small = 'style="font-size:13px;color:#333;margin:4px 0 12px;padding-left:18px"'
     if d.others:
-        annex.append('<p style="font-size:13px;margin:16px 0 4px"><b>Other events this week</b> '
+        annex.append('<p style="font-size:13px;margin:16px 0 4px"><b>Other events, next 7 days</b> '
                      '<span style="color:#777">(not detected as protests; check in case one is)</span></p>')
         annex.append(f"<ul {small}>" + "".join(
             f'<li>{e_(fmt_when(e))}: <a href="{e_(e.source_url)}">{e_(e.title)}</a></li>' for e in d.others) + "</ul>")
@@ -295,67 +298,108 @@ def render_html(d):
         annex.append(f"<ul {small}>" + ("".join(
             f'<li><a href="{e_(n["link"])}">{e_(n["title"])}</a></li>' for n in items) or "<li>Nothing found.</li>") + "</ul>")
     annex.append(f'<p style="font-size:12px;color:#777">Sources: <a href="{RM_CALENDAR}">Résistance Montréal calendar</a> '
-                 "(community-run, Montreal-centric), Google News search. Sent by protest-digest.</p>")
+                 "(community-run, Montreal-centric), Google News search.</p>")
     return ('<div style="font-family:system-ui,Segoe UI,sans-serif;max-width:720px;color:#111">'
             f'<h2 style="font-size:17px;margin:0 0 4px">{e_(subject(d))}</h2>' + "".join(rows) + "".join(annex) + "</div>")
 
 
-def send(d):
-    if os.environ.get("RESEND_API_KEY"):
-        return send_resend(d)
-    return send_gmail(d)
+# ---------- calendar feed ----------
+
+def ics_text(s):
+    return s.replace("\\", "\\\\").replace(";", "\\;").replace(",", "\\,").replace("\n", "\\n")
 
 
-def send_resend(d):
-    """Resend's HTTP API. Without a verified domain, the onboarding sender only delivers to the account's own address."""
-    to = os.environ["DIGEST_TO"]
-    body = {
-        "from": os.environ.get("DIGEST_FROM") or "Protest digest <onboarding@resend.dev>",
-        "to": [to],
-        "subject": subject(d),
-        "text": render_text(d),
-        "html": render_html(d),
-    }
-    req = urllib.request.Request(
-        "https://api.resend.com/emails", data=json.dumps(body).encode(), method="POST",
-        headers={"Authorization": f"Bearer {os.environ['RESEND_API_KEY'].strip()}",
-                 "Content-Type": "application/json", "User-Agent": UA})
-    try:
-        with urllib.request.urlopen(req, timeout=30) as r:
-            r.read()
-    except urllib.error.HTTPError as e:
-        raise SystemExit(f"Resend refused the email ({e.code}): {e.read().decode(errors='replace')}")
-    return to
+def ics_fold(line):
+    """Split lines longer than 75 bytes (RFC 5545), never inside a UTF-8 character."""
+    b = line.encode("utf-8")
+    parts, limit = [], 75
+    while len(b) > limit:
+        cut = limit
+        while b[cut] & 0xC0 == 0x80:
+            cut -= 1
+        parts.append(b[:cut])
+        b, limit = b[cut:], 74
+    parts.append(b)
+    return "\r\n ".join(x.decode("utf-8") for x in parts)
 
 
-def send_gmail(d):
-    user = os.environ["GMAIL_USER"]
-    password = os.environ["GMAIL_APP_PASSWORD"].replace(" ", "")
-    to = os.environ.get("DIGEST_TO") or user
-    msg = EmailMessage()
-    msg["Subject"] = subject(d)
-    msg["From"] = f"Protest digest <{user}>"
-    msg["To"] = to
-    msg.set_content(render_text(d))
-    msg.add_alternative(render_html(d), subtype="html")
-    with smtplib.SMTP_SSL("smtp.gmail.com", 465, context=ssl.create_default_context()) as s:
-        s.login(user, password)
-        s.send_message(msg)
-    return to
+def ics_utc(dt):
+    if TZ is None:  # no tz database: floating local time
+        return dt.strftime("%Y%m%dT%H%M%S")
+    return dt.replace(tzinfo=TZ).astimezone(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+
+
+def event_uid(ev):
+    key = ev.source_url.rstrip("/").rsplit("/", 1)[-1] if ev.source_url else \
+        hashlib.sha1(f"{ev.title}|{ev.start.isoformat()}".encode()).hexdigest()[:16]
+    return f"{key}@protest-digest"
+
+
+def render_ics(events):
+    lines = [
+        "BEGIN:VCALENDAR", "VERSION:2.0", "PRODID:-//protest-digest//EN", "CALSCALE:GREGORIAN", "METHOD:PUBLISH",
+        "X-WR-CALNAME:Manifs Montréal & Saint-Jean",
+        "X-WR-CALDESC:" + ics_text("Upcoming protests from the Résistance Montréal calendar. Updated daily."),
+        "X-WR-TIMEZONE:America/Montreal", "REFRESH-INTERVAL;VALUE=DURATION:PT6H", "X-PUBLISHED-TTL:PT6H",
+    ]
+    for ev in events:
+        all_day = ev.start.strftime("%H:%M") == "00:00"
+        desc = "\n".join(x for x in (
+            f"{ev.city}" + (" (time not given)" if all_day else ""),
+            excerpt(ev.description, 800) if ev.description else "",
+            f"Official page: {ev.official_url}" if ev.official_url else "",
+            f"Résistance Montréal: {ev.source_url}" if ev.source_url else "",
+        ) if x)
+        lines += ["BEGIN:VEVENT", f"UID:{event_uid(ev)}", f"DTSTAMP:{ics_utc(datetime.combine(ev.start.date(), datetime.min.time()))}"]
+        if all_day:
+            lines += [f"DTSTART;VALUE=DATE:{ev.start:%Y%m%d}",
+                      f"DTEND;VALUE=DATE:{ev.start.date() + timedelta(days=1):%Y%m%d}"]
+        else:
+            lines += [f"DTSTART:{ics_utc(ev.start)}", f"DTEND:{ics_utc(ev.start + timedelta(hours=2))}"]
+        lines += [f"SUMMARY:{ics_text(ev.title)}", f"LOCATION:{ics_text(fmt_where(ev))}",
+                  f"DESCRIPTION:{ics_text(desc)}", f"CATEGORIES:{ics_text(ev.city)}"]
+        if ev.official_url or ev.source_url:
+            lines.append(f"URL:{ev.official_url or ev.source_url}")
+        lines += ["TRANSP:TRANSPARENT", "END:VEVENT"]
+    lines.append("END:VCALENDAR")
+    return "\r\n".join(ics_fold(x) for x in lines) + "\r\n"
+
+
+def render_page(d):
+    stamp = datetime.now(TZ).strftime("%Y-%m-%d %H:%M") if TZ else datetime.now().strftime("%Y-%m-%d %H:%M")
+    return (
+        '<!doctype html><html lang="en"><head><meta charset="utf-8">'
+        '<meta name="viewport" content="width=device-width, initial-scale=1"><meta name="color-scheme" content="light">'
+        f"<title>Protests · Montréal & Saint-Jean</title></head>"
+        '<body style="margin:0;padding:20px 16px;background:#fff">'
+        + render_html(d)
+        + '<div style="font-family:system-ui,Segoe UI,sans-serif;max-width:720px;font-size:12px;color:#777;margin-top:16px">'
+        f'Calendar feed: <a href="protests.ics">protests.ics</a> (next {CALENDAR_DAYS} days, '
+        f"subscribe to it by URL in your calendar app). Updated {stamp} Montreal time.</div></body></html>\n"
+    )
+
+
+def write_outputs(d, out_dir=OUT_DIR):
+    out_dir.mkdir(exist_ok=True)
+    (out_dir / ".nojekyll").touch()
+    (out_dir / "protests.ics").write_bytes(render_ics(d.calendar).encode("utf-8"))
+    (out_dir / "index.html").write_text(render_page(d), encoding="utf-8")
 
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--dry-run", action="store_true", help="print instead of sending")
+    ap.add_argument("--print", action="store_true", help="print the 7-day digest instead of writing files")
     ap.add_argument("--start", help="first day YYYY-MM-DD (default: today, Montreal time)")
     args = ap.parse_args()
     d = build(date.fromisoformat(args.start) if args.start else None)
-    if args.dry_run:
+    if args.print:
         sys.stdout.reconfigure(encoding="utf-8")
         print(render_text(d))
-        Path(__file__).with_name("digest.html").write_text(render_html(d), encoding="utf-8")
         return
-    print(f"sent to {send(d)}: {subject(d)}")
+    if not d.source_ok:
+        sys.exit("not writing anything: " + "; ".join(d.warnings))
+    write_outputs(d)
+    print(f"{len(d.calendar)} protests in the calendar, {len(d.protests)} in the next 7 days")
 
 
 if __name__ == "__main__":

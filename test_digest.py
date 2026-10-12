@@ -1,7 +1,7 @@
 """Offline checks of the parser and filters: python -m unittest"""
 
 import unittest
-from datetime import date
+from datetime import date, timedelta, timezone
 
 import digest
 
@@ -75,10 +75,33 @@ class ParseTest(unittest.TestCase):
         self.assertTrue(got["Bouffe contre le fascisme"][0])
         self.assertEqual(got["Piquetage"], (True, "Saint-Jean-sur-Richelieu"))
 
+    def test_ics(self):
+        evs = digest.parse_rm_calendar(page(
+            card("Manif; pour, le \\ logement " + "é" * 60, "Ligne 1\nLigne 2", slug="manif-logement"),
+            card("Vigile", start="2026-10-20 00:00:00", slug="vigile-1"),
+        ))
+        old = digest.TZ
+        digest.TZ = timezone(timedelta(hours=-4))
+        try:
+            ics = digest.render_ics(evs)
+        finally:
+            digest.TZ = old
+        lines = ics.split("\r\n")
+        self.assertTrue(all(len(x.encode("utf-8")) <= 75 for x in lines))
+        unfolded = ics.replace("\r\n ", "")
+        self.assertIn("DTSTART:20261016T170000Z", unfolded)
+        self.assertIn("DTEND:20261016T190000Z", unfolded)
+        self.assertIn("SUMMARY:Manif\\; pour\\, le \\\\ logement " + "é" * 60, unfolded)
+        self.assertIn("UID:manif-logement@protest-digest", unfolded)
+        self.assertIn("DTSTART;VALUE=DATE:20261020", unfolded)
+        self.assertIn("DTEND;VALUE=DATE:20261021", unfolded)
+        self.assertEqual(unfolded.count("BEGIN:VEVENT"), 2)
+        self.assertTrue(ics.endswith("END:VCALENDAR\r\n"))
+
     def test_render(self):
         evs = digest.parse_rm_calendar(page(card("Manif <b>test</b>")))
         d = digest.Digest(start=date(2026, 10, 12), end=date(2026, 10, 18), protests=evs)
-        self.assertIn("Protests this week (1) · Mon 12 Oct – Sun 18 Oct", digest.render_text(d))
+        self.assertIn("Protests, next 7 days (1) · Mon 12 Oct – Sun 18 Oct", digest.render_text(d))
         self.assertIn("Fri 16 Oct, 13:00 | Manif test | Parc Jarry, métro Jarry", digest.render_text(d))
         self.assertIn("nothing listed", digest.render_text(d))
         digest.render_html(d)
