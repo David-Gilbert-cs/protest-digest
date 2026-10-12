@@ -23,12 +23,17 @@ the main signal for it.
 
 ## Setup
 
-1. Turn on 2-step verification for the Gmail account, then create an app password at
-   <https://myaccount.google.com/apppasswords>.
-2. Repository secrets (Settings → Secrets and variables → Actions):
-   `GMAIL_USER` (the sending Gmail address), `GMAIL_APP_PASSWORD`, and optionally `DIGEST_TO`
-   (the recipient; defaults to `GMAIL_USER`).
-3. Actions tab → "Weekly protest digest" → "Run workflow" to send one now.
+Sending uses [Resend](https://resend.com) when `RESEND_API_KEY` is set, otherwise Gmail.
+
+**Resend (no phone needed):** sign up, create an API key with "Sending access", then set repository secrets
+`RESEND_API_KEY` and `DIGEST_TO`. Without a verified domain, Resend only delivers to the address the account
+was created with, so `DIGEST_TO` must be that address.
+
+**Gmail:** turn on 2-step verification, create an app password at
+<https://myaccount.google.com/apppasswords>, then set secrets `GMAIL_USER`, `GMAIL_APP_PASSWORD` and
+optionally `DIGEST_TO` (defaults to `GMAIL_USER`).
+
+Then Actions tab → "Weekly protest digest" → "Run workflow" to send one now.
 
 ## Local use
 

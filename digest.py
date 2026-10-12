@@ -3,17 +3,22 @@
   python digest.py              build the digest for the next 7 days and email it
   python digest.py --dry-run    print it instead (also writes digest.html next to this file)
 
-Environment: GMAIL_USER, GMAIL_APP_PASSWORD (a Google "app password"), DIGEST_TO (defaults to GMAIL_USER).
+Environment, either
+  RESEND_API_KEY, DIGEST_TO (the Resend account's own address unless a domain is verified), optional DIGEST_FROM
+or
+  GMAIL_USER, GMAIL_APP_PASSWORD (a Google "app password"), DIGEST_TO (defaults to GMAIL_USER).
 """
 
 import argparse
 import html
+import json
 import os
 import re
 import smtplib
 import ssl
 import sys
 import unicodedata
+import urllib.error
 import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
@@ -296,6 +301,34 @@ def render_html(d):
 
 
 def send(d):
+    if os.environ.get("RESEND_API_KEY"):
+        return send_resend(d)
+    return send_gmail(d)
+
+
+def send_resend(d):
+    """Resend's HTTP API. Without a verified domain, the onboarding sender only delivers to the account's own address."""
+    to = os.environ["DIGEST_TO"]
+    body = {
+        "from": os.environ.get("DIGEST_FROM") or "Protest digest <onboarding@resend.dev>",
+        "to": [to],
+        "subject": subject(d),
+        "text": render_text(d),
+        "html": render_html(d),
+    }
+    req = urllib.request.Request(
+        "https://api.resend.com/emails", data=json.dumps(body).encode(), method="POST",
+        headers={"Authorization": f"Bearer {os.environ['RESEND_API_KEY'].strip()}",
+                 "Content-Type": "application/json", "User-Agent": UA})
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            r.read()
+    except urllib.error.HTTPError as e:
+        raise SystemExit(f"Resend refused the email ({e.code}): {e.read().decode(errors='replace')}")
+    return to
+
+
+def send_gmail(d):
     user = os.environ["GMAIL_USER"]
     password = os.environ["GMAIL_APP_PASSWORD"].replace(" ", "")
     to = os.environ.get("DIGEST_TO") or user
